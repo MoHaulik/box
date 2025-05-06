@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>WebXR Mario Box Hitter</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <style>
+    body { 
+      margin: 0; 
+      overflow: hidden;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    }
+    #overlay {
+      position: absolute;
+      top: 20px;
+      left: 20px;
+      z-index: 1;
+    }
+    #start-button {
+      padding: 12px 24px;
+      font-size: 18px;
+      background: rgba(255, 72, 72, 0.8);
+      color: white;
+      border: none;
+      border-radius: 30px;
+      box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+      cursor: pointer;
+      transition: all 0.3s ease;
+    }
+    #start-button:hover {
+      background: rgba(255, 72, 72, 1);
+      transform: translateY(-2px);
+      box-shadow: 0 6px 12px rgba(0,0,0,0.3);
+    }
+    #status {
+      margin-top: 15px;
+      font-size: 16px;
+      background: rgba(0, 0, 0, 0.5);
+      color: white;
+      padding: 10px 15px;
+      border-radius: 12px;
+      display: none;
+      backdrop-filter: blur(5px);
+      box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+    }
+    #score-display {
+      position: absolute;
+      top: 20px;
+      right: 20px;
+      background: rgba(0, 0, 0, 0.5);
+      color: white;
+      font-size: 24px;
+      padding: 10px 15px;
+      border-radius: 12px;
+      display: none;
+      backdrop-filter: blur(5px);
+      z-index: 1;
+    }
+  </style>
+</head>
+<body>
+  <div id="overlay">
+    <button id="start-button">Start Mario AR</button>
+    <div id="status"></div>
+  </div>
+  <div id="score-display">Coins: 0</div>
+  
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.150.1/build/three.module.js';
+    import { ARButton } from 'https://unpkg.com/three@0.150.1/examples/jsm/webxr/ARButton.js';
+    import { GLTFLoader } from 'https://unpkg.com/three@0.150.1/examples/jsm/loaders/GLTFLoader.js';
+
+    let camera, scene, renderer;
+    let controller;
+    let questionBox;
+    let coinModel;
+    let hitCooldown = false;
+    let coins = 0;
+    let clock = new THREE.Clock();
+    
+    // Sound effects
+    let coinSound, bumpSound;
+    let audioListener;
+    
+    // For hit detection
+    let raycaster = new THREE.Raycaster();
+    let prevHandPosition = new THREE.Vector3();
+    let currentHandPosition = new THREE.Vector3();
+    let handVelocity = new THREE.Vector3();
+    
+    // Animation properties
+    let boxHitAnimation = {
+      active: false,
+      startY: 0,
+      time: 0,
+      duration: 0.3
+    };
+    
+    let activeCoin = null;
+    
+    init();
+
+    function init() {
+      // Scene setup
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+      
+      // Audio setup
+      audioListener = new THREE.AudioListener();
+      camera.add(audioListener);
+      
+      coinSound = new THREE.Audio(audioListener);
+      bumpSound = new THREE.Audio(audioListener);
+      
+      const audioLoader = new THREE.AudioLoader();
+      
+      // Load coin sound
+      audioLoader.load('https://cdn.jsdelivr.net/gh/rikush/mario-sounds@main/smb_coin.mp3', function(buffer) {
+        coinSound.setBuffer(buffer);
+        coinSound.setVolume(0.5);
+      });
+      
+      // Load bump sound
+      audioLoader.load('https://cdn.jsdelivr.net/gh/rikush/mario-sounds@main/smb_bump.mp3', function(buffer) {
+        bumpSound.setBuffer(buffer);
+        bumpSound.setVolume(0.5);
+      });
+
+      // Renderer setup
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.xr.enabled = true;
+      renderer.setClearColor(0x000000, 0);
+      renderer.shadowMap.enabled = true;
+      document.body.appendChild(renderer.domElement);
+
+      // Lighting
+      const ambientLight = new THREE.AmbientLight(0x404040, 2);
+      scene.add(ambientLight);
+
+      const directionalLight = new THREE.DirectionalLight(0xffffff, 1.5);
+      directionalLight.position.set(1, 1, 1);
+      directionalLight.castShadow = true;
+      scene.add(directionalLight);
+
+      // Start button event
+      document.getElementById('start-button').addEventListener('click', () => {
+        if (navigator.xr) {
+          navigator.xr.isSessionSupported('immersive-ar').then((supported) => {
+            if (supported) {
+              const sessionInit = { 
+                requiredFeatures: ['hit-test', 'hand-tracking'],
+                optionalFeatures: ['dom-overlay'], 
+                domOverlay: { root: document.body } 
+              };
+              navigator.xr.requestSession('immersive-ar', sessionInit).then(onSessionStarted);
+            } else {
+              updateStatus('WebXR AR session with hand tracking is not supported on this device.');
+            }
+          });
+        } else {
+          updateStatus('WebXR is not supported in this browser.');
+        }
+      });
+
+      // Handle window resize
+      window.addEventListener('resize', onWindowResize);
+      
+      // Preload coin model
+      const loader = new THREE.TextureLoader();
+      
+      // Create a coin geometry (as fallback if GLTF doesn't load)
+      const coinGeometry = new THREE.CylinderGeometry(0.02, 0.02, 0.005, 16);
+      const coinMaterial = new THREE.MeshStandardMaterial({
+        color: 0xFFD700,
+        metalness: 1,
+        roughness: 0.3,
+        emissive: 0xBB8500,
+        emissiveIntensity: 0.3
+      });
+      coinModel = new THREE.Mesh(coinGeometry, coinMaterial);
+      coinModel.rotation.x = Math.PI / 2;
+    }
+
+    function updateStatus(message) {
+      const statusElement = document.getElementById('status');
+      statusElement.style.display = 'block';
+      statusElement.textContent = message;
+    }
+
+    function onWindowResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    function onSessionStarted(session) {
+      // Set up XR session
+      renderer.xr.setReferenceSpaceType('local');
+      renderer.xr.setSession(session);
+      
+      // Hide button and show status
+      document.getElementById('start-button').style.display = 'none';
+      document.getElementById('score-display').style.display = 'block';
+      updateStatus('Looking for surface...');
+
+      // Create the question box
+      createQuestionBox();
+      
+      // Set up controller and hand tracking
+      setupHandTracking(session);
+
+      // Start animation loop
+      renderer.setAnimationLoop(render);
+
+      // Handle session end
+      session.addEventListener('end', onSessionEnd);
+    }
+
+    function onSessionEnd() {
+      updateStatus('AR session ended');
+      document.getElementById('start-button').style.display = 'block';
+      document.getElementById('score-display').style.display = 'none';
+    }
+
+    function createQuestionBox() {
+      // Load question mark texture
+      const textureLoader = new THREE.TextureLoader();
+      const questionMarkTexture = textureLoader.load('https://raw.githubusercontent.com/mrdoob/three.js/dev/examples/textures/question_mark.png');
+      
+      // Create a more Mario-like question box
+      const geometry = new THREE.BoxGeometry(0.15, 0.15, 0.15);
+      
+      // Create box materials with different colors/textures for each side
+      const materials = [
+        new THREE.MeshStandardMaterial({ map: questionMarkTexture, color: 0xFFA500 }), // right
+        new THREE.MeshStandardMaterial({ map: questionMarkTexture, color: 0xFFA500 }), // left
+        new THREE.MeshStandardMaterial({ map: questionMarkTexture, color: 0xFFA500 }), // top
+        new THREE.MeshStandardMaterial({ map: questionMarkTexture, color: 0xFFA500 }), // bottom
+        new THREE.MeshStandardMaterial({ map: questionMarkTexture, color: 0xFFA500 }), // front
+        new THREE.MeshStandardMaterial({ map: questionMarkTexture, color: 0xFFA500 })  // back
+      ];
+      
+      questionBox = new THREE.Mesh(geometry, materials);
+      questionBox.position.set(0, 0.15, -0.5); // Position in front and above the camera
+      questionBox.castShadow = true;
+      questionBox.receiveShadow = true;
+      
+      // Add some ambient animation (floating/rotating slightly)
+      questionBox.userData = {
+        originalY: questionBox.position.y,
+        hitCount: 0,
+        maxHits: 5, // How many times the box can be hit
+        lastHitTime: 0
+      };
+      
+      scene.add(questionBox);
+      
+      updateStatus('Question box created! Hit it from below with your hand!');
+    }
+
+    function setupHandTracking(session) {
+      // Create controller for hand tracking
+      controller = renderer.xr.getController(0);
+      controller.addEventListener('connected', (event) => {
+        const xrInputSource = event.data;
+        if (xrInputSource.hand) {
+          updateStatus(`Hand tracking activated!`);
+        } else {
+          updateStatus(`Controller connected: ${xrInputSource.handedness}. Please use hand tracking.`);
+        }
+      });
+      
+      scene.add(controller);
+      
+      // Add a visual for the hand/controller
+      const controllerGeometry = new THREE.SphereGeometry(0.03, 16, 16);
+      const controllerMaterial = new THREE.MeshStandardMaterial({
+        color: 0xFF0000,
+        roughness: 0.3,
+        metalness: 0.5
+      });
+      const controllerMesh = new THREE.Mesh(controllerGeometry, controllerMaterial);
+      controller.add(controllerMesh);
+    }
+    
+    function createCoin() {
+      // Create a coin that rises from the box
+      const coin = coinModel.clone();
+      
+      // Start position at the top of the box
+      coin.position.copy(questionBox.position);
+      coin.position.y += 0.1;
+      
+      // Add to scene
+      scene.add(coin);
+      
+      // Play coin sound
+      if (coinSound.buffer) {
+        coinSound.play();
+      }
+      
+      // Update score
+      coins++;
+      document.getElementById('score-display').textContent = `Coins: ${coins}`;
+      
+      // Animation properties
+      coin.userData = {
+        startTime: clock.getElapsedTime(),
+        startY: coin.position.y,
+        duration: 1.0
+      };
+      
+      return coin;
+    }
+    
+    function updateCoinAnimation(coin, time) {
+      if (!coin) return false;
+      
+      const elapsedTime = time - coin.userData.startTime;
+      const progress = Math.min(elapsedTime / coin.userData.duration, 1.0);
+      
+      // Rise up and fade out
+      coin.position.y = coin.userData.startY + progress * 0.5;
+      coin.rotation.y += 0.1;
+      
+      // Scale and opacity
+      const scale = 1.0 + progress * 0.5;
+      coin.scale.set(scale, scale, scale);
+      
+      // Return true if animation is complete
+      if (progress >= 1.0) {
+        scene.remove(coin);
+        return true;
+      }
+      
+      return false;
+    }
+    
+    function updateBoxHitAnimation(time) {
+      if (!boxHitAnimation.active) return;
+      
+      const progress = Math.min((time - boxHitAnimation.time) / boxHitAnimation.duration, 1.0);
+      
+      if (progress < 0.5) {
+        // Move up during first half
+        const upProgress = progress * 2; // 0 to 1 during first half
+        questionBox.position.y = boxHitAnimation.startY + 0.05 * Math.sin(upProgress * Math.PI);
+      } else {
+        // Move down during second half
+        const downProgress = (progress - 0.5) * 2; // 0 to 1 during second half
+        questionBox.position.y = boxHitAnimation.startY + 0.05 * Math.sin((1 - downProgress) * Math.PI);
+      }
+      
+      // End animation
+      if (progress >= 1.0) {
+        boxHitAnimation.active = false;
+        questionBox.position.y = boxHitAnimation.startY;
+      }
+    }
+    
+    function checkHandHit(frame) {
+      if (!questionBox || !controller || hitCooldown) return;
+      
+      // Get current hand position
+      prevHandPosition.copy(currentHandPosition);
+      controller.getWorldPosition(currentHandPosition);
+      
+      // Calculate velocity (frame-to-frame movement)
+      handVelocity.subVectors(currentHandPosition, prevHandPosition);
+      
+      // Check if hand is below the box
+      if (currentHandPosition.y < questionBox.position.y && 
+          Math.abs(currentHandPosition.x - questionBox.position.x) < 0.15 &&
+          Math.abs(currentHandPosition.z - questionBox.position.z) < 0.15) {
+        
+        // Check if moving upward with sufficient velocity
+        if (handVelocity.y > 0.01) {
+          hitBox();
+        }
+      }
+    }
+    
+    function hitBox() {
+      // Ignore if on cooldown
+      if (hitCooldown || boxHitAnimation.active) return;
+      
+      // Check if box still has hits remaining
+      if (questionBox.userData.hitCount >= questionBox.userData.maxHits) {
+        // Box is used up, play bump sound
+        if (bumpSound.buffer) {
+          bumpSound.play();
+        }
+        return;
+      }
+      
+      // Increment hit count
+      questionBox.userData.hitCount++;
+      questionBox.userData.lastHitTime = clock.getElapsedTime();
+      
+      // Start hit animation
+      boxHitAnimation.active = true;
+      boxHitAnimation.startY = questionBox.position.y;
+      boxHitAnimation.time = clock.getElapsedTime();
+      
+      // Create a coin
+      activeCoin = createCoin();
+      
+      // Set cooldown
+      hitCooldown = true;
+      setTimeout(() => { hitCooldown = false; }, 500);
+      
+      // Change box appearance if max hits reached
+      if (questionBox.userData.hitCount >= questionBox.userData.maxHits) {
+        // Make it look "used up" (darker color)
+        questionBox.material.forEach(mat => {
+          mat.color.set(0x8B4513); // Dark brown
+          mat.emissive.set(0x000000);
+        });
+      }
+    }
+
+    function render(timestamp, frame) {
+      const time = clock.getElapsedTime();
+      
+      if (frame) {
+        const referenceSpace = renderer.xr.getReferenceSpace();
+        const session = renderer.xr.getSession();
+        
+        // Check for hand hit
+        checkHandHit(frame);
+        
+        // Handle box animations
+        if (questionBox) {
+          // Apply floating animation when not being hit
+          if (!boxHitAnimation.active) {
+            const floatOffset = Math.sin(time * 2) * 0.005;
+            questionBox.position.y = questionBox.userData.originalY + floatOffset;
+            questionBox.rotation.y += 0.005;
+          } else {
+            // Update hit animation
+            updateBoxHitAnimation(time);
+          }
+        }
+        
+        // Update coin animation if active
+        if (activeCoin) {
+          const done = updateCoinAnimation(activeCoin, time);
+          if (done) {
+            activeCoin = null;
+          }
+        }
+      }
+      
+      renderer.render(scene, camera);
+    }
+  </script>
+</body>
+</html>
